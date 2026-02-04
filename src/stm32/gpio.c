@@ -33,7 +33,7 @@ DECL_ENUMERATION_RANGE("pin", "PH0", GPIO('H', 0), 16);
 DECL_ENUMERATION_RANGE("pin", "PI0", GPIO('I', 0), 16);
 #endif
 
-static GPIO_TypeDef * const digital_regs[] = {
+GPIO_TypeDef * const digital_regs[] = {
     ['A' - 'A'] = GPIOA, GPIOB, GPIOC,
 #ifdef GPIOD
     ['D' - 'A'] = GPIOD,
