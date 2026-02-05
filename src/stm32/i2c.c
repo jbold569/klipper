@@ -91,12 +91,6 @@ i2c_get_configured_rate(I2C_TypeDef *i2c)
 static void
 i2c_init(I2C_TypeDef *i2c, uint32_t rate)
 {
-    // uint32_t pclk = get_pclock_frequency((uint32_t)i2c);
-    // i2c->CR2 = pclk / 1000000;
-    // i2c->CCR = pclk / 100000 / 2;
-    // i2c->TRISE = (pclk / 1000000) + 1;
-    // i2c->CR1 = I2C_CR1_PE;
-
     uint32_t pclk = get_pclock_frequency((uint32_t)i2c);
     uint32_t pclk_mhz = pclk / 1000000;
     
@@ -134,11 +128,13 @@ i2c_init(I2C_TypeDef *i2c, uint32_t rate)
     i2c->CR1 = I2C_CR1_PE;
 }
 
-// Work around stm32 errata causing busy bit to be stuck
-// "2.9.7 I2C analog filter may provide wrong value, locking BUSY
-// flag and preventing master mode entry"
+// Work around stm2 errata causing busy bit to be stuck
+// STM32F103xC/D/E Errata Sheet (ES0340), Section 2.9.7:
+// "I2C analog filter may provide wrong value, locking BUSY flag and 
+//  preventing master mode entry"
+// https://www.st.com/resource/en/errata_sheet/es0340-stm32f101xcde-stm32f103xcde-device-errata-stmicroelectronics.pdf
 static int
-i2c_stm32f1_busy_errata(I2C_TypeDef *i2c, uint32_t rate, uint8_t at_init)
+i2c_stm32f1_busy_errata(I2C_TypeDef *i2c, uint32_t rate)
 {
     if (!CONFIG_MACH_STM32F1)
         return 0;
@@ -146,56 +142,13 @@ i2c_stm32f1_busy_errata(I2C_TypeDef *i2c, uint32_t rate, uint8_t at_init)
     const struct i2c_info *ii =
       container_of((I2C_TypeDef * const *)i2c, struct i2c_info, i2c);
 
-    // Pre-check: If SCL is stuck low, do bus recovery first
-    GPIO_TypeDef *scl_regs = digital_regs[GPIO2PORT(ii->scl_pin)];
-    uint8_t scl_initial = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
-
-    if (!scl_initial) {
-        output("I2C errata: SCL stuck low, attempting bus recovery");
-        
-        // Configure as GPIO to generate clock pulses
-        gpio_peripheral(ii->scl_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
-        gpio_peripheral(ii->sda_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
-        
-        struct gpio_out scl_gpio = {
-            .regs = digital_regs[GPIO2PORT(ii->scl_pin)],
-            .bit = GPIO2BIT(ii->scl_pin)
-        };
-        
-        // Generate up to 9 clock pulses to let slave finish
-        for (int i = 0; i < 9; i++) {
-            gpio_out_write(scl_gpio, 0);
-            // Small delay (~5us for 100kHz half period)
-            for (volatile int j = 0; j < 100; j++) __asm__ volatile("nop");
-            
-            gpio_out_write(scl_gpio, 1);
-            for (volatile int j = 0; j < 100; j++) __asm__ volatile("nop");
-            
-            // Check if SCL is now high
-            if (scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin))) {
-                output("I2C errata: Bus recovery succeeded after %i pulses", i + 1);
-                break;
-            }
-        }
-        
-        // Check final state
-        scl_initial = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
-        if (!scl_initial) {
-            output("I2C errata: Bus recovery FAILED - SCL still low");
-            return -7;  // New error code for bus recovery failure
-        }
-    }
-    output("I2C errata: Starting workaround, rate=%u", rate);
-
     // Step 1: Disable I2C peripheral
     i2c->CR1 &= ~I2C_CR1_PE;
-    output("I2C errata: Step 1 - PE bit cleared");
     
-    // Clear status registers (helpful but not in official errata)
+    // Clear status registers
     (void)i2c->SR1;
     (void)i2c->SR2;
 
-    // Create gpio_out structures for writing
     struct gpio_out scl_gpio = {
       .regs = digital_regs[GPIO2PORT(ii->scl_pin)],
       .bit = GPIO2BIT(ii->scl_pin)
@@ -206,137 +159,74 @@ i2c_stm32f1_busy_errata(I2C_TypeDef *i2c, uint32_t rate, uint8_t at_init)
       .bit = GPIO2BIT(ii->sda_pin)
     };
 
-    // Step 2: Configure GPIO as General Purpose Output Open-Drain, High
+    GPIO_TypeDef *scl_regs = digital_regs[GPIO2PORT(ii->scl_pin)];
+    GPIO_TypeDef *sda_regs = digital_regs[GPIO2PORT(ii->sda_pin)];
+
+    // Step 2: Configure GPIO as Output Open-Drain, High
     gpio_peripheral(ii->scl_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
     gpio_peripheral(ii->sda_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
-    output("I2C errata: Step 2 - GPIO configured as OD output, high");
-    
-    // Brief delay for GPIO configuration to settle
-    __asm__ volatile("nop");
-    __asm__ volatile("nop");
 
     // Step 3: Check SCL and SDA High level
-    // Read directly from GPIO IDR register
-    // GPIO_TypeDef *scl_regs = digital_regs[GPIO2PORT(ii->scl_pin)];
-    GPIO_TypeDef *sda_regs = digital_regs[GPIO2PORT(ii->sda_pin)];
-    uint8_t scl_high = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
-    uint8_t sda_high = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
-    
-    output("I2C errata: Step 3 - SCL=%u SDA=%u (expect both 1)", scl_high, sda_high);
-    
-    if (!scl_high || !sda_high) {
-        output("I2C errata: Step 3 FAILED - pins not high (hardware fault)");
+    uint8_t scl = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
+    uint8_t sda = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
+    if (!scl || !sda) {
+        output("I2C errata: Step 3 failed - SCL=%u SDA=%u expected SCL=1 SDA=1", scl, sda);
         return -1;
     }
-    output("I2C errata: Step 3 PASSED");
 
-    // Step 4: Configure SDA as Output Open-Drain, Low
+    // Step 4: Set SDA Low
     gpio_out_write(sda_gpio, 0);
-    output("I2C errata: Step 4 - SDA set low");
     
-    for (volatile int i = 0; i < 2000; i++) __asm__ volatile("nop");
-
     // Step 5: Check SDA Low level
-    uint8_t sda_low = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
-    output("I2C errata: Step 5 - SDA=%u (expect 0)", sda_low);
-    
-    if (sda_low) {
-        if (!at_init) {
-            output("I2C errata: Step 5 FAILED - SDA stuck high");
-            return -2;  // Hard fail during transaction
-        }
-        // During init, just log and continue
-        output("I2C errata: Step 5 warning ignored at init");
+    sda = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
+    if (sda) {
+        output("I2C errata: Step 5 failed - SDA=%u expected SDA=0", sda);
+        return -2;
     }
-    output("I2C errata: Step 5 PASSED");
 
-    // Step 6: Configure SCL as Output Open-Drain, Low
+    // Step 6: Set SCL Low
     gpio_out_write(scl_gpio, 0);
-    output("I2C errata: Step 6 - SCL set low");
-    
-    for (volatile int i = 0; i < 200; i++) __asm__ volatile("nop");
     
     // Step 7: Check SCL Low level
-    scl_high = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
-    output("I2C errata: Step 7 - SCL=%u (expect 0)", scl_high);
-    
-    if (scl_high) {
-        if (!at_init) {
-            output("I2C errata: Step 7 FAILED - SCL stuck high");
-            return -3;
-        }
-         output("I2C errata: Step 7 warning ignored at init");
+    scl = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
+    if (scl) {
+        output("I2C errata: Step 7 failed - SCL=%u expected SCL=0", scl);
+        return -3;
     }
-    output("I2C errata: Step 7 PASSED");
 
-    // Step 8: Configure SCL as Output Open-Drain, High
+    // Step 8: Set SCL High
     gpio_out_write(scl_gpio, 1);
-    output("I2C errata: Step 8 - SCL set high");
     
-    for (volatile int i = 0; i < 2000; i++) __asm__ volatile("nop");
-
     // Step 9: Check SCL High level
-    scl_high = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
-    output("I2C errata: Step 9 - SCL=%u (expect 1)", scl_high);
-    
-    if (!scl_high) {
-        output("I2C errata: Step 9 FAILED - SCL stuck low (slave stretching?)");
-        if (!at_init) {
-            return -4;  // Hard fail during transaction
-        }
-        output("I2C errata: Step 9 warning ignored at init");
+    scl = !!(scl_regs->IDR & (1 << GPIO2BIT(ii->scl_pin)));
+    if (!scl) {
+        output("I2C errata: Step 9 failed - SCL=%u expected SCL=1", scl);
+        return -4;
     }
-    output("I2C errata: Step 9 PASSED");
 
-    // Step 10: Configure SDA as Output Open-Drain, High
+    // Step 10: Set SDA High
     gpio_out_write(sda_gpio, 1);
-    output("I2C errata: Step 10 - SDA set high");
     
-    for (volatile int i = 0; i < 200; i++) __asm__ volatile("nop");
-
     // Step 11: Check SDA High level
-    sda_high = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
-    output("I2C errata: Step 11 - SDA=%u (expect 1)", sda_high);
-    
-    if (!sda_high) {
-        output("I2C errata: Step 11 FAILED - SDA stuck low (slave holding?)");
+    sda = !!(sda_regs->IDR & (1 << GPIO2BIT(ii->sda_pin)));
+    if (!sda) {
+        output("I2C errata: Step 11 failed - SDA=%u expected SDA=1", sda);
         return -5;
     }
-    output("I2C errata: Step 11 PASSED");
 
     // Step 12: Configure as Alternate Function Open-Drain
     gpio_peripheral(ii->scl_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
     gpio_peripheral(ii->sda_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
-    output("I2C errata: Step 12 - Configured as AF open-drain");
 
     // Step 13: Set SWRST bit
     i2c->CR1 = I2C_CR1_SWRST;
-    output("I2C errata: Step 13 - SWRST set");
-    
-    // Brief delay for reset to take effect
-    __asm__ volatile("nop");
-    __asm__ volatile("nop");
-    __asm__ volatile("nop");
 
     // Step 14: Clear SWRST bit
     i2c->CR1 = 0;
-    output("I2C errata: Step 14 - SWRST cleared");
 
-    // Step 15: Re-initialize and enable I2C peripheral
+    // Step 15: Re-initialize I2C peripheral
     i2c_init(i2c, rate);
-    output("I2C errata: Step 15 - I2C re-initialized at %u Hz", rate);
     
-    // Verify BUSY flag is now clear
-    uint32_t sr2 = i2c->SR2;
-    uint8_t busy = (sr2 & I2C_SR2_BUSY) ? 1 : 0;
-    output("I2C errata: Post-workaround SR2=%u BUSY=%u", sr2, busy);
-    
-    if (busy) {
-        output("I2C errata: WARNING - BUSY flag still set after workaround!");
-        return -6;
-    }
-    
-    output("I2C errata: SUCCESS - workaround complete");
     return 0;
 }
 
@@ -352,7 +242,7 @@ i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
     if (!is_enabled_pclock((uint32_t)i2c)) {
         // Enable i2c clock and gpio
         enable_pclock((uint32_t)i2c);
-        i2c_stm32f1_busy_errata(i2c, rate, 1);
+        i2c_stm32f1_busy_errata(i2c, rate);
         gpio_peripheral(ii->scl_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
         gpio_peripheral(ii->sda_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
         i2c->CR1 = I2C_CR1_SWRST;
@@ -395,7 +285,7 @@ i2c_start(I2C_TypeDef *i2c, uint8_t addr, uint8_t xfer_len,
           uint32_t timeout)
 {
     int ret = 0;
-    int retries = 1;
+    int retries = 2;
     uint32_t start_timeout = timeout - I2C_TIMEOUT_START_ERRATA_US;
 
 restart:
@@ -406,22 +296,14 @@ restart:
     // lines can get wedged. Try to resolve this at the start
     // of a transaction.
     if (CONFIG_MACH_STM32F1 && ret == I2C_BUS_BUSY) {
-        if (i2c->SR2 & I2C_SR2_BUSY) {
-            output("I2C: BUSY condition after timeout, SR1=%u SR2=%u", 
-                   i2c->SR1, i2c->SR2);
-            if (retries--) {
-	            uint32_t rate = i2c_get_configured_rate(i2c);
-	            if (i2c_stm32f1_busy_errata(i2c, rate, 0) != 0) {
-                    output("I2C: Errata workaround FAILED");
-                }
-                // reset the original deadline
-                start_timeout = timeout;
-                goto restart;
+        if (retries--) {
+            uint32_t rate = i2c_get_configured_rate(i2c);
+            if (i2c_stm32f1_busy_errata(i2c, rate) != 0) {
+                output("I2C: Errata workaround attempt (%i) FAILED", retries+1);
             }
-        }
-        else {
-            output("I2C: Retry exhausted, BUSY condition persists");
-            return I2C_BUS_BUSY;
+            // reset the original deadline
+            start_timeout = timeout;
+            goto restart;
         }
     }
 
