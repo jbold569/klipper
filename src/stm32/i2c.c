@@ -84,7 +84,7 @@ i2c_get_configured_rate(I2C_TypeDef *i2c)
         // f_scl = f_pclk1 / (2 × CCR)
         rate = pclk / (2 * ccr);
     }
-    
+    output("I2C: Rate configured @ %iHz fast_mode=%u pclk=%i ccr=%i duty bit=%i", rate, fast_mode, pclk, ccr, duty_16_9);    
     return rate;
 }
 
@@ -251,7 +251,7 @@ i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
         // Set rate frequency and enable
         i2c_init(i2c, rate);
     }
-
+    i2c_get_configured_rate(i2c);
     return (struct i2c_config){ .i2c=i2c, .addr=addr<<1 };
 }
 
